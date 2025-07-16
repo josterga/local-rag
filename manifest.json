@@ -1,0 +1,9 @@
+{
+  "id": "local-rag",
+  "name": "Local RAG",
+  "version": "1.0.0",
+  "description": "A sidebar chat plugin for RAG-style queries inside your notes.",
+  "author": "Your Name",
+  "main": "main.js",
+  "minAppVersion": "0.15.0"
+}

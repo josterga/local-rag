@@ -5,31 +5,83 @@ import {
   TFile,
   WorkspaceLeaf,
   Notice,
+  PluginSettingTab,
+  Setting,
 } from "obsidian";
 
+// View type constant
 const VIEW_TYPE_RAG_CHAT = "rag-chat-view";
 
-// === Ollama config ===
-const OLLAMA_URL = "http://localhost:11434";
-const OLLAMA_EMBEDDING_MODEL = "mxbai-embed-large";
-const OLLAMA_LLM_MODEL = "llama3";
-const MAX_CONTEXT_TOKENS = 700;
+// === Settings interface & defaults ===
+interface RAGChatSettings {
+  ollamaUrl: string;
+  llmModel: string;
+  embeddingModel: string;
+  maxContextTokens: number;
+  llmOptions: string[];
+  embeddingOptions: string[];
+}
 
-// Plugin main
+const DEFAULT_SETTINGS: RAGChatSettings = {
+  ollamaUrl: "http://localhost:11434",
+  llmModel: "",
+  embeddingModel: "",
+  maxContextTokens: 700,
+  llmOptions: [],
+  embeddingOptions: [],
+};
+
+// === Helper to fetch model list from Ollama ===
+async function fetchOllamaModels(
+  ollamaUrl: string
+): Promise<{ llmModels: string[]; embeddingModels: string[] }> {
+  try {
+    const resp = await fetch(`${ollamaUrl}/api/tags`);
+    if (!resp.ok) throw new Error(`HTTP error ${resp.status}`);
+    const data = await resp.json();
+    const allModels: string[] = data.models?.map((m: any) => m.model) ?? [];
+
+    // Example separation logic: models containing "embed" (case-insensitive) are embedding models
+    const embeddingModels = allModels.filter((name) =>
+      name.toLowerCase().includes("embed")
+    );
+    const llmModels = allModels.filter(
+      (name) => !name.toLowerCase().includes("embed")
+    );
+
+    return {
+      llmModels,
+      embeddingModels,
+    };
+  } catch (e) {
+    console.warn("Failed to fetch Ollama models:", e);
+    // On failure, return empty arrays
+    return { llmModels: [], embeddingModels: [] };
+  }
+}
+
+// === Main Plugin Class ===
 export default class RAGChatPlugin extends Plugin {
+  settings!: RAGChatSettings;
+
   async onload() {
+    await this.loadSettings();
+    await this.refreshModelOptions();
+
     this.registerView(
       VIEW_TYPE_RAG_CHAT,
       (leaf) => new RAGChatView(leaf, this)
     );
+
     this.addCommand({
       id: "open-rag-chat",
       name: "Open RAG Chat",
       callback: () => this.activateView(),
     });
-    this.app.workspace.onLayoutReady(() => {
-      this.activateView();
-    });
+
+    this.addSettingTab(new RAGChatSettingTab(this.app, this));
+
+    this.app.workspace.onLayoutReady(() => this.activateView());
   }
 
   onunload() {
@@ -37,20 +89,43 @@ export default class RAGChatPlugin extends Plugin {
   }
 
   async activateView() {
-    let leaf: WorkspaceLeaf | null =
-      this.app.workspace.getLeavesOfType(VIEW_TYPE_RAG_CHAT)[0] ?? null;
+    let leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE_RAG_CHAT)[0];
     if (!leaf) leaf = this.app.workspace.getLeaf(false);
     if (!leaf) {
       new Notice("Could not open RAG Chat panel.");
       return;
     }
-    await leaf.setViewState({
-      type: VIEW_TYPE_RAG_CHAT,
-      active: true,
-    });
+    await leaf.setViewState({ type: VIEW_TYPE_RAG_CHAT, active: true });
     this.app.workspace.revealLeaf(leaf);
   }
 
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+  }
+
+  async saveSettings() {
+    await this.saveData(this.settings);
+  }
+
+  async refreshModelOptions() {
+    const { ollamaUrl } = this.settings;
+
+    const { llmModels, embeddingModels } = await fetchOllamaModels(ollamaUrl);
+
+    this.settings.llmOptions = llmModels;
+    this.settings.embeddingOptions = embeddingModels;
+
+    // Ensure selected models are valid; default to first option if not
+    if (!this.settings.llmOptions.includes(this.settings.llmModel)) {
+      this.settings.llmModel = this.settings.llmOptions[0] || "";
+    }
+    if (!this.settings.embeddingOptions.includes(this.settings.embeddingModel)) {
+      this.settings.embeddingModel = this.settings.embeddingOptions[0] || "";
+    }
+    await this.saveSettings();
+  }
+
+  // === Search method reused as-is (slight cleanup) ===
   async searchNotes(query: string): Promise<{ file: TFile; snippet: string }[]> {
     const STOP_WORDS = new Set([
       "what", "are", "the", "is", "of", "on", "to", "in", "and", "or",
@@ -70,9 +145,7 @@ export default class RAGChatPlugin extends Plugin {
         let firstIdx = -1;
         for (const word of keywords) {
           const idx = contentLower.indexOf(word);
-          if (idx !== -1 && (firstIdx === -1 || idx < firstIdx)) {
-            firstIdx = idx;
-          }
+          if (idx !== -1 && (firstIdx === -1 || idx < firstIdx)) firstIdx = idx;
         }
         const snippet = content
           .slice(Math.max(0, firstIdx - 50), firstIdx + 150)
@@ -84,24 +157,33 @@ export default class RAGChatPlugin extends Plugin {
   }
 }
 
-// === Ollama Helpers ===
+// === Ollama Helpers that use settings ===
 
-async function ollamaEmbed(text: string): Promise<number[]> {
-  const resp = await fetch(`${OLLAMA_URL}/api/embed`, {
+async function ollamaEmbed(text: string, plugin: RAGChatPlugin): Promise<number[]> {
+  const resp = await fetch(`${plugin.settings.ollamaUrl}/api/embed`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: OLLAMA_EMBEDDING_MODEL, input: text }),
+    body: JSON.stringify({
+      model: plugin.settings.embeddingModel,
+      input: text,
+    }),
   });
   const raw = await resp.text();
   const data = safeParseOllamaJson(raw);
   return data.embedding || data.embeddings?.[0];
 }
 
-async function ollamaEmbedBatch(texts: string[]): Promise<number[][]> {
-  const resp = await fetch(`${OLLAMA_URL}/api/embed`, {
+async function ollamaEmbedBatch(
+  texts: string[],
+  plugin: RAGChatPlugin
+): Promise<number[][]> {
+  const resp = await fetch(`${plugin.settings.ollamaUrl}/api/embed`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: OLLAMA_EMBEDDING_MODEL, input: texts }),
+    body: JSON.stringify({
+      model: plugin.settings.embeddingModel,
+      input: texts,
+    }),
   });
   const raw = await resp.text();
   const data = safeParseOllamaJson(raw);
@@ -111,12 +193,16 @@ async function ollamaEmbedBatch(texts: string[]): Promise<number[][]> {
   return data.embeddings;
 }
 
-async function ollamaChat(context: string, query: string): Promise<string> {
-  const resp = await fetch(`${OLLAMA_URL}/api/chat`, {
+async function ollamaChat(
+  context: string,
+  query: string,
+  plugin: RAGChatPlugin
+): Promise<string> {
+  const resp = await fetch(`${plugin.settings.ollamaUrl}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: OLLAMA_LLM_MODEL,
+      model: plugin.settings.llmModel,
       stream: false,
       messages: [
         {
@@ -155,7 +241,7 @@ function safeParseOllamaJson(raw: string): any {
   }
 }
 
-// === Sidebar Chat View ===
+// === Sidebar Chat View with improved UI ===
 
 class RAGChatView extends ItemView {
   plugin: RAGChatPlugin;
@@ -179,49 +265,53 @@ class RAGChatView extends ItemView {
   }
 
   async onOpen() {
-  const container = this.containerEl;
-  container.empty();
+    const container = this.containerEl;
+    container.empty();
 
-  container.setAttr("style",
-    "height: 100%; width: 100%; min-width: 200px; display: flex; flex-direction: column; overflow: hidden;"
-  );
-
-  const outerContainer = container.createDiv("rag-chat-outer");
-  outerContainer.setAttr("style",
-    "display: flex; flex-direction: column; flex: 1 1 0; height: 100%; width: 100%; background: var(--background-primary);"
-  );
-
-  // Chat messages - add bottom padding larger than input height to avoid overlap
-  this.chatContainer = outerContainer.createDiv("rag-chat-messages");
-  this.chatContainer.setAttr(
-    "style",
-    "flex: 1 1 auto; overflow-y: auto; border: 1px solid var(--divider-color); padding: 16px 16px 80px 16px; box-sizing: border-box; border-radius: 8px 8px 0 0;" +
-    "background-color: var(--background-modifier-hover); font-size: 15px; min-height: 0; width: 100%;"
-  );
-
-  // Input container shifted up by 5% of height (approx)
-  const inputContainer = outerContainer.createDiv();
-  inputContainer.setAttr("style",
-    "display: flex; flex-shrink: 0; gap: 8px; align-items: flex-end;" +
-    "width: 100%; box-sizing: border-box; padding: 12px; background: var(--background-primary); border-top: 1px solid var(--divider-color);" +
-    "transform: translateY(-5%);"
-  );
-
-    // Input expands to fill available width, button stays visible
-    this.inputEl = inputContainer.createEl("textarea", { placeholder: "Ask a question..." });
-    this.inputEl.setAttr("rows", "1");
-    this.inputEl.setAttr("style",
-      "flex: 1 1 0; min-width: 0; resize: none; max-height: 120px;" +
-      "padding: 10px 12px; font-size: 15px; border-radius: 6px;" +
-      "border: 1px solid var(--interactive-accent); overflow-y: auto;" +
-      "font-family: var(--font-monospace); color: var(--text-normal); box-sizing: border-box;"
+    container.setAttr(
+      "style",
+      "height: 100%; width: 100%; min-width: 200px; display: flex; flex-direction: column; overflow: hidden;"
     );
 
+    const outerContainer = container.createDiv("rag-chat-outer");
+    outerContainer.setAttr(
+      "style",
+      "display: flex; flex-direction: column; flex: 1 1 0; height: 100%; width: 100%; background: var(--background-primary);"
+    );
+
+    this.chatContainer = outerContainer.createDiv("rag-chat-messages");
+    this.chatContainer.setAttr(
+      "style",
+      "flex: 1 1 auto; overflow-y: auto; border: 1px solid var(--divider-color); padding: 16px 16px 80px 16px; box-sizing: border-box; border-radius: 8px 8px 0 0;" +
+        "background-color: var(--background-modifier-hover); font-size: 15px; min-height: 0; width: 100%;"
+    );
+
+    const inputContainer = outerContainer.createDiv();
+    inputContainer.setAttr(
+      "style",
+      "display: flex; flex-shrink: 0; gap: 8px; align-items: stretch;" +
+        "width: 100%; box-sizing: border-box; padding: 12px; background: var(--background-primary); border-top: 1px solid var(--divider-color);" +
+        "transform: translateY(-5%);"
+    );
+
+    // Input textarea
+    this.inputEl = inputContainer.createEl("textarea", { placeholder: "Ask a question..." });
+    this.inputEl.setAttr("rows", "1");
+    this.inputEl.setAttr(
+      "style",
+      "flex: 1 1 0; min-width: 0; resize: none; max-height: 120px;" +
+        "padding: 10px 12px; font-size: 15px; border-radius: 6px;" +
+        "border: 1px solid var(--interactive-accent); overflow-y: auto;" +
+        "font-family: var(--font-monospace); color: var(--text-normal); box-sizing: border-box;"
+    );
+
+    // Automatically resize textarea height
     this.inputEl.addEventListener("input", () => {
       this.inputEl.style.height = "auto";
       this.inputEl.style.height = Math.min(this.inputEl.scrollHeight, 120) + "px";
       this.inputEl.style.overflowY = this.inputEl.scrollHeight > 120 ? "auto" : "hidden";
     });
+
     this.inputEl.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
@@ -229,11 +319,14 @@ class RAGChatView extends ItemView {
       }
     });
 
+    // Send button fills height
     const sendButton = inputContainer.createEl("button", { text: "Send" });
-    sendButton.setAttr("style", `
+    sendButton.setAttr(
+      "style",
+      `
       flex-shrink: 0;
       height: 100%;
-      padding: 0px 18px;
+      padding: 0 18px;
       border-radius: 6px;
       border: none;
       background-color: var(--interactive-accent);
@@ -243,26 +336,34 @@ class RAGChatView extends ItemView {
       cursor: pointer;
       transition: background-color 0.2s;
       user-select: none;
-      max-height: 44px;
       min-width: 64px;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-    `);
-    sendButton.onmouseenter = () => { sendButton.style.backgroundColor = "var(--interactive-accent-pressed)"; };
-    sendButton.onmouseleave = () => { sendButton.style.backgroundColor = "var(--interactive-accent)"; };
+    `
+    );
+
+    sendButton.onmouseenter = () => {
+      sendButton.style.backgroundColor = "var(--interactive-accent-pressed)";
+    };
+    sendButton.onmouseleave = () => {
+      sendButton.style.backgroundColor = "var(--interactive-accent)";
+    };
     sendButton.onclick = () => this.handleSubmit();
   }
 
   addMessage(role: "user" | "rag", text: string) {
     const msg = this.chatContainer.createDiv();
-    msg.setAttr("style",
+    msg.setAttr(
+      "style",
       `margin-bottom: 14px; padding: 14px 20px; border-radius: 10px; white-space: pre-wrap; word-break: break-word; user-select: text;` +
-      `width: 100%; box-sizing: border-box; font-size: 15px; line-height: 1.45;` +
-      `color: var(--text-normal); background-color: ${
-        role === "user" ? "var(--background-primary)" : "var(--background-secondary-alt)"
-      }; border: 1px solid var(--divider-color);` +
-      `align-self: ${role === "user" ? "flex-end" : "flex-start"};`
+        `width: 100%; box-sizing: border-box; font-size: 15px; line-height: 1.45;` +
+        `color: var(--text-normal); background-color: ${
+          role === "user"
+            ? "var(--background-primary)"
+            : "var(--background-secondary-alt)"
+        }; border: 1px solid var(--divider-color);` +
+        `align-self: ${role === "user" ? "flex-end" : "flex-start"};`
     );
     msg.createSpan({ text });
     this.chatContainer.scrollTop = this.chatContainer.scrollHeight;
@@ -280,7 +381,7 @@ class RAGChatView extends ItemView {
 
     for (const r of rankedSnippets) {
       const snippetTokens = this.approximateTokenCount(r.snippet) + 20;
-      if (tokenCount + snippetTokens > MAX_CONTEXT_TOKENS) break;
+      if (tokenCount + snippetTokens > this.plugin.settings.maxContextTokens) break;
       tokenCount += snippetTokens;
       chunks.push(`File: ${r.file.basename}\n${r.snippet}`);
     }
@@ -305,9 +406,9 @@ class RAGChatView extends ItemView {
       }
 
       this.addMessage("rag", "generating response...");
-      const queryEmbedding = await ollamaEmbed(query);
+      const queryEmbedding = await ollamaEmbed(query, this.plugin);
       const snippets = results.map((r) => r.snippet);
-      const snippetEmbeddings = await ollamaEmbedBatch(snippets);
+      const snippetEmbeddings = await ollamaEmbedBatch(snippets, this.plugin);
 
       const ranked = results
         .map((res, i) => ({
@@ -317,9 +418,9 @@ class RAGChatView extends ItemView {
         .sort((a, b) => b.sim - a.sim);
 
       const context = this.buildContextWithTokenLimit(ranked);
-      const answer = await ollamaChat(context, query);
+      const answer = await ollamaChat(context, query, this.plugin);
 
-      this.chatContainer.lastChild?.remove(); // remove loading message
+      this.chatContainer.lastChild?.remove(); // remove "loading" message
       this.addMessage("rag", answer.trim());
     } catch (err: any) {
       this.chatContainer.lastChild?.remove();
@@ -330,4 +431,96 @@ class RAGChatView extends ItemView {
   }
 
   async onClose() {}
+}
+
+// === Settings panel ===
+class RAGChatSettingTab extends PluginSettingTab {
+  plugin: RAGChatPlugin;
+
+  constructor(app: App, plugin: RAGChatPlugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  async display() {
+    const { containerEl } = this;
+    containerEl.empty();
+
+    containerEl.createEl("h2", { text: "RAG Chat Plugin Settings" });
+
+    new Setting(containerEl)
+      .setName("Ollama URL")
+      .setDesc("Base URL for your Ollama server.")
+      .addText((text) =>
+        text
+          .setPlaceholder("http://localhost:11434")
+          .setValue(this.plugin.settings.ollamaUrl)
+          .onChange(async (value) => {
+            this.plugin.settings.ollamaUrl = value.trim();
+            await this.plugin.saveSettings();
+            await this.plugin.refreshModelOptions();
+            this.display();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Embedding Model")
+      .setDesc("Model for embeddings. Refresh the model list if you add new models.")
+      .addDropdown((dd) => {
+        if (this.plugin.settings.embeddingOptions.length === 0) {
+          dd.addOption("", "-- No embedding models found --");
+          dd.setDisabled(true);
+          return;
+        }
+        this.plugin.settings.embeddingOptions.forEach((m) => dd.addOption(m, m));
+        dd.setValue(this.plugin.settings.embeddingModel || "");
+        dd.onChange(async (value) => {
+          this.plugin.settings.embeddingModel = value;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("LLM Model")
+      .setDesc("Language model for answering.")
+      .addDropdown((dd) => {
+        if (this.plugin.settings.llmOptions.length === 0) {
+          dd.addOption("", "-- No LLM models found --");
+          dd.setDisabled(true);
+          return;
+        }
+        this.plugin.settings.llmOptions.forEach((m) => dd.addOption(m, m));
+        dd.setValue(this.plugin.settings.llmModel || "");
+        dd.onChange(async (value) => {
+          this.plugin.settings.llmModel = value;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Max Context Tokens")
+      .setDesc("How many tokens to send as context to the model (approximate).")
+      .addSlider((slider) =>
+        slider
+          .setLimits(256, 8192, 64)
+          .setValue(this.plugin.settings.maxContextTokens)
+          .onChange(async (value) => {
+            this.plugin.settings.maxContextTokens = value;
+            await this.plugin.saveSettings();
+          })
+          .setDynamicTooltip()
+      );
+
+    new Setting(containerEl).addButton((btn) =>
+      btn
+        .setButtonText("Refresh Model List")
+        .setCta()
+        .onClick(async () => {
+          btn.setButtonText("Refreshing...");
+          await this.plugin.refreshModelOptions();
+          this.display();
+          btn.setButtonText("Refresh Model List");
+        })
+    );
+  }
 }

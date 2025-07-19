@@ -208,7 +208,7 @@ async function ollamaChat(
         {
           role: "system",
           content:
-            "You are a helpful assistant for an Obsidian vault. Only answer using the context provided.",
+"You are a collaborator for an Obsidian vault. Your primary task is to retrieve and summarize only what is present in the context provided. Do not speculate or invent information. When suitable, after a summary, connect related ideas or challenge thinking with thoughtful questions—but always base these on the context. Clearly separate factual summarization from creative insights or questions.",
         },
         { role: "user", content: `Context:\n${context}\n\nQuery: ${query}` },
       ],
